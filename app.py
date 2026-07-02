@@ -12,7 +12,8 @@ Sections
 4  Customer Cohorts   — new vs returning customers over time
 5  Revenue Forecast   — Prophet 3-month forecast + holdout accuracy panel
 6  State Anomalies    — month-over-month change detection + AI insights
-7  Data Explorer      — natural-language → SQL → live results
+7  Data Explorer      — natural-language → SQL → live results, with a
+                        transparency panel (intent, confidence, reasoning)
 
 Design: all business logic lives in data_utils.py; this file is pure presentation.
 """
@@ -226,6 +227,28 @@ section[data-testid="stSidebar"] {
 .result-count { font-size: 1rem; font-weight: 700; color: var(--positive); }
 .result-label { font-size: 0.78rem; color: var(--text-muted); }
 
+/* ── NL→SQL transparency panel ── */
+.nlsql-meta-strip {
+    display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
+    margin-bottom: 0.85rem;
+}
+.nlsql-badge {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    padding: 0.22rem 0.65rem; border-radius: 20px;
+    font-size: 0.68rem; font-weight: 700; letter-spacing: 0.04em;
+    border: 1px solid var(--border);
+}
+.badge-template { background: rgba(16,185,129,0.1); color: #10B981; border-color: rgba(16,185,129,0.25); }
+.badge-llm      { background: rgba(108,142,245,0.1); color: var(--accent); border-color: rgba(108,142,245,0.3); }
+.badge-conf-high { background: rgba(16,185,129,0.1);  color: #10B981;  border-color: rgba(16,185,129,0.25); }
+.badge-conf-mid  { background: rgba(245,158,11,0.1);  color: #F59E0B;  border-color: rgba(245,158,11,0.25); }
+.badge-conf-low  { background: rgba(239,68,68,0.1);   color: #EF4444;  border-color: rgba(239,68,68,0.25); }
+.nlsql-reasoning {
+    font-size: 0.78rem; color: var(--text-muted); line-height: 1.6;
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 6px; padding: 0.7rem 0.9rem; margin-bottom: 0.85rem;
+}
+
 /* ── Streamlit overrides ── */
 [data-testid="stDataFrame"] { border-radius: 6px; overflow: hidden; }
 [data-testid="stDataFrame"] th {
@@ -376,7 +399,7 @@ try:
         <div class="kpi-cell">
             <div class="kpi-label">Total Revenue</div>
             <div class="kpi-value">{_fmt_brl(kpi["total_revenue"])}</div>
-            <div class="kpi-sub">All delivered orders</div>
+            <div class="kpi-sub">All delivered orders (sum of item price)</div>
         </div>
         <div class="kpi-cell">
             <div class="kpi-label">Total Orders</div>
@@ -386,12 +409,12 @@ try:
         <div class="kpi-cell">
             <div class="kpi-label">Avg Order Value</div>
             <div class="kpi-value">{_fmt_brl(kpi["avg_order_value"])}</div>
-            <div class="kpi-sub">Per line item</div>
+            <div class="kpi-sub">Per order (item totals summed, then averaged)</div>
         </div>
         <div class="kpi-cell">
             <div class="kpi-label">Total Customers</div>
             <div class="kpi-value">{kpi["total_customers"]:,}</div>
-            <div class="kpi-sub">Unique customer IDs</div>
+            <div class="kpi-sub">Unique real people (customer_unique_id)</div>
         </div>
         <div class="kpi-cell">
             <div class="kpi-label">Top State</div>
@@ -459,7 +482,10 @@ try:
     except EnvironmentError as exc:
         st.error(str(exc))
 
-except (DataValidationError, Exception) as exc:
+except DataValidationError as exc:
+    st.error("Failed to load product performance data.")
+    logger.exception(exc)
+except Exception as exc:
     st.error("Failed to load product performance data.")
     logger.exception(exc)
 
@@ -572,7 +598,9 @@ _divider()
 # ══════════════════════════════════════════════════════════════════════════════
 _section(
     "Predictive Analytics", "3-Month Revenue Forecast",
-    "Prophet time-series model trained on monthly revenue aggregates. "
+    "Prophet time-series model trained on monthly revenue aggregates "
+    "(changepoint_prior_scale=0.5, tuned in notebook — 27.1% out-of-sample MAPE "
+    "vs. 35.9% with Prophet's default settings). "
     "Dashed line = forecast; shaded band = 80% confidence interval. "
     "Dotted vertical = train/forecast boundary.",
 )
@@ -611,7 +639,8 @@ try:
         st.markdown(
             '<p style="font-size:0.78rem;color:#64748B;line-height:1.6;">'
             "In-sample fit always overstates real performance. The table below "
-            "evaluates the model on months it never saw during training."
+            "evaluates the model on months it never saw during training, using the "
+            "same tuned settings as the production forecast above."
             "</p>", unsafe_allow_html=True,
         )
         try:
@@ -644,41 +673,49 @@ _divider()
 _section(
     "AI Analysis", "State Revenue Anomalies",
     "Detects states with month-over-month revenue swings exceeding 30%. "
-    "Click below to generate an executive-level AI briefing powered by .",
+    "Click below to generate an executive-level AI briefing powered by Groq GPT-OSS 120B.",
 )
+
+# Computed once and reused by both tabs below, instead of re-querying the
+# anomaly-detection SQL a second time when the "AI Executive Briefing" tab
+# is opened.
+_anomaly_error: Exception | None = None
+try:
+    _changes, _month_analyzed = get_significant_changes(engine)
+except Exception as exc:
+    _changes, _month_analyzed = pd.DataFrame(), None
+    _anomaly_error = exc
+    logger.exception(exc)
 
 tabs = st.tabs(["Anomaly Data", "AI Executive Briefing"])
 
 with tabs[0]:
-    try:
-        changes, month_analyzed = get_significant_changes(engine)
-        if not changes.empty:
-            _col_label(f"Significant Changes — {month_analyzed}")
-
-            # .applymap() removed in Pandas 2.1+ — use .map() instead
-            def _style_pct(val: float):
-                try:
-                    color = "#10B981" if float(val) > 0 else "#EF4444"
-                    return f"color: {color}; font-weight: 600"
-                except (TypeError, ValueError):
-                    return ""
-
-            display_cols = ["customer_state", "revenue", "prev_revenue", "pct_change"]
-            styled = (
-                changes[display_cols]
-                .style.map(_style_pct, subset=["pct_change"])
-                .format({
-                    "revenue":      "R$ {:,.2f}",
-                    "prev_revenue": "R$ {:,.2f}",
-                    "pct_change":   "{:+.1f}%",
-                })
-            )
-            st.dataframe(styled, width="stretch")
-        else:
-            st.info("No statistically significant changes detected for the latest period.")
-    except Exception as exc:
+    if _anomaly_error is not None:
         st.error("Failed to load anomaly data.")
-        logger.exception(exc)
+    elif not _changes.empty:
+        _col_label(f"Significant Changes — {_month_analyzed}")
+
+        # .applymap() removed in Pandas 2.1+ — use .map() instead
+        def _style_pct(val: float):
+            try:
+                color = "#10B981" if float(val) > 0 else "#EF4444"
+                return f"color: {color}; font-weight: 600"
+            except (TypeError, ValueError):
+                return ""
+
+        display_cols = ["customer_state", "revenue", "prev_revenue", "pct_change"]
+        styled = (
+            _changes[display_cols]
+            .style.map(_style_pct, subset=["pct_change"])
+            .format({
+                "revenue":      "R$ {:,.2f}",
+                "prev_revenue": "R$ {:,.2f}",
+                "pct_change":   "{:+.1f}%",
+            })
+        )
+        st.dataframe(styled, width="stretch")
+    else:
+        st.info("No statistically significant changes detected for the latest period.")
 
 with tabs[1]:
     try:
@@ -687,19 +724,20 @@ with tabs[1]:
         st.error(str(exc))
     else:
         if st.button("Generate AI Briefing"):
-            with st.spinner("Generating executive briefing..."):
-                try:
-                    changes, month_analyzed = get_significant_changes(engine)
-                    if not changes.empty:
-                        insight = generate_ai_insight(changes, month_analyzed, client)
+            if _anomaly_error is not None:
+                st.error("Anomaly data unavailable — cannot generate a briefing.")
+            elif _changes.empty:
+                st.info("No significant changes to brief on for this period.")
+            else:
+                with st.spinner("Generating executive briefing..."):
+                    try:
+                        insight = generate_ai_insight(_changes, _month_analyzed, client)
                         st.markdown(f'<div class="insight-block">{insight}</div>', unsafe_allow_html=True)
-                    else:
-                        st.info("No significant changes to brief on for this period.")
-                except InsightGenerationError as exc:
-                    st.error(f"Insight generation failed: {exc}")
-                except Exception as exc:
-                    st.error("An unexpected error occurred.")
-                    logger.exception(exc)
+                    except InsightGenerationError as exc:
+                        st.error(f"Insight generation failed: {exc}")
+                    except Exception as exc:
+                        st.error("An unexpected error occurred.")
+                        logger.exception(exc)
 
 _divider()
 
@@ -708,17 +746,19 @@ _divider()
 # ══════════════════════════════════════════════════════════════════════════════
 _section(
     "Data Explorer", "Natural Language SQL",
-    "Ask a question in plain English. The model translates it to SQL, "
-    "executes it live against the database, and returns results below. "
-    "Only SELECT queries are permitted.",
+    "Ask a question in plain English. Common questions are answered with a "
+    "verified SQL template; anything else is translated by the LLM using a "
+    "business-rule dictionary, then auto-corrected and self-reviewed before "
+    "running. Only SELECT queries are permitted.",
 )
 
 EXAMPLE_QUERIES = [
+    "How many unique customers are there?",
+    "What is the total revenue?",
     "Which product category generated the most revenue in SP?",
-    "What is the monthly revenue trend for 2018?",
+    "Repeat customers",
     "Top 5 cities by total number of orders",
-    "Average order value by payment type",
-    "Which states have the highest freight costs?",
+    "Average order value",
 ]
 
 st.markdown(
@@ -736,9 +776,20 @@ st.markdown("<br>", unsafe_allow_html=True)
 
 user_question = st.text_input(
     "Question",
-    placeholder="e.g. Which product category sold the most in São Paulo?",
+    placeholder="e.g. How many unique customers are there?",
     label_visibility="collapsed",
 )
+
+
+def _confidence_badge_class(confidence: int | None) -> str:
+    if confidence is None:
+        return "badge-conf-mid"
+    if confidence >= 80:
+        return "badge-conf-high"
+    if confidence >= 50:
+        return "badge-conf-mid"
+    return "badge-conf-low"
+
 
 if st.button("Run Query"):
     if not user_question.strip():
@@ -749,22 +800,51 @@ if st.button("Run Query"):
         except EnvironmentError as exc:
             st.error(str(exc))
         else:
-            with st.spinner("Translating to SQL and executing..."):
+            with st.spinner("Detecting intent, generating SQL, and validating..."):
                 result = ask_data_question(user_question, engine, client)
 
-            if result["status"] == "not_relevant":
+            if result["status"] == "ambiguous":
+                st.info(f"🤔 {result['message']}")
+
+            elif result["status"] == "not_relevant":
                 st.warning(
                     "This question does not appear to relate to the sales dataset. "
                     "Try asking about orders, products, revenue, customers, or geographic performance."
                 )
+
             elif result["status"] == "unsafe":
                 st.code(result["sql"], language="sql")
                 st.error("Query blocked — only SELECT statements are permitted.")
+
             elif result["status"] == "error":
                 if result["sql"]:
                     st.code(result["sql"], language="sql")
                 st.error(result["message"])
-            else:
+
+            else:  # status == "ok"
+                source_badge = (
+                    '<span class="nlsql-badge badge-template">📋 Template Match</span>'
+                    if result["source"] == "template"
+                    else '<span class="nlsql-badge badge-llm">🧠 LLM Generated</span>'
+                )
+                conf = result.get("confidence")
+                conf_class = _confidence_badge_class(conf)
+                conf_label = f"{conf}% confidence" if conf is not None else "confidence n/a"
+
+                st.markdown(
+                    f'<div class="nlsql-meta-strip">{source_badge}'
+                    f'<span class="nlsql-badge {conf_class}">✓ {conf_label}</span>'
+                    f'<span class="nlsql-badge" style="color:#94A3B8;">'
+                    f'intent: {result.get("intent") or "n/a"}</span></div>',
+                    unsafe_allow_html=True,
+                )
+
+                if result.get("reasoning"):
+                    st.markdown(
+                        f'<div class="nlsql-reasoning">{result["reasoning"]}</div>',
+                        unsafe_allow_html=True,
+                    )
+
                 st.code(result["sql"], language="sql")
                 st.markdown(
                     f'<div class="result-banner">'

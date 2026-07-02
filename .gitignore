@@ -1,6 +1,6 @@
 # Project-specific
 .env
-data/sales_pulse.db
+# data/sales_pulse.db
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

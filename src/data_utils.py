@@ -1,406 +1,3 @@
-# """
-# data_utils.py
-# Core data access and AI utility functions for Sales Pulse AI.
-# Handles DB connections, SQL analytics queries, forecasting, and LLM-powered insights.
-# """
-
-# import os
-# import logging
-# from functools import lru_cache
-# from typing import Optional
-
-# import pandas as pd
-# from sqlalchemy import create_engine, text
-# from sqlalchemy.engine import Engine
-# from dotenv import load_dotenv
-# from groq import Groq, GroqError
-# from prophet import Prophet
-
-# # ---------------------------------------------------------------------------
-# # Setup
-# # ---------------------------------------------------------------------------
-
-# load_dotenv()
-
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-# )
-# logger = logging.getLogger("data_utils")
-
-# DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "sales_pulse.db")
-# GROQ_MODEL = "llama-3.3-70b-versatile"
-
-# FORBIDDEN_SQL_KEYWORDS = (
-#     "INSERT", "UPDATE", "DELETE", "DROP", "ALTER",
-#     "CREATE", "TRUNCATE", "ATTACH", "PRAGMA", "REPLACE"
-# )
-
-
-# # ---------------------------------------------------------------------------
-# # Custom exceptions
-# # ---------------------------------------------------------------------------
-
-# class UnsafeQueryError(Exception):
-#     """Raised when a generated SQL query fails the safety check."""
-
-
-# class InsightGenerationError(Exception):
-#     """Raised when the LLM fails to generate a usable insight."""
-
-
-# # ---------------------------------------------------------------------------
-# # DB connection
-# # ---------------------------------------------------------------------------
-
-# @lru_cache(maxsize=1)
-# def get_engine() -> Engine:
-#     """
-#     Returns a cached SQLAlchemy engine pointing to the local SQLite DB.
-#     Cached so we don't reopen a new connection pool on every Streamlit rerun.
-#     """
-#     if not os.path.exists(DB_PATH):
-#         raise FileNotFoundError(
-#             f"Database not found at {DB_PATH}. Run the data pipeline notebook first."
-#         )
-#     logger.info("Creating DB engine at %s", DB_PATH)
-#     return create_engine(f"sqlite:///{DB_PATH}")
-
-
-# def run_query(engine: Engine, sql: str, params: Optional[dict] = None) -> pd.DataFrame:
-#     """
-#     Centralized query runner with error handling and logging.
-#     Always use this instead of pd.read_sql directly so failures are caught consistently.
-#     """
-#     try:
-#         with engine.connect() as conn:
-#             return pd.read_sql(text(sql), conn, params=params)
-#     except Exception as e:
-#         logger.error("Query failed: %s | SQL: %s", e, sql)
-#         raise
-
-
-# # ---------------------------------------------------------------------------
-# # Analytics queries
-# # ---------------------------------------------------------------------------
-
-# def get_top_categories(engine: Engine, limit: int = 10) -> pd.DataFrame:
-#     sql = """
-#         SELECT product_category_name,
-#                ROUND(SUM(price), 2) AS total_revenue,
-#                COUNT(DISTINCT order_id) AS total_orders
-#         FROM sales_master
-#         GROUP BY product_category_name
-#         ORDER BY total_revenue DESC
-#         LIMIT :limit
-#     """
-#     return run_query(engine, sql, {"limit": limit})
-
-
-# def get_state_revenue(engine: Engine, limit: int = 10) -> pd.DataFrame:
-#     sql = """
-#         SELECT customer_state,
-#                ROUND(SUM(price), 2) AS total_revenue,
-#                COUNT(DISTINCT order_id) AS total_orders
-#         FROM sales_master
-#         GROUP BY customer_state
-#         ORDER BY total_revenue DESC
-#         LIMIT :limit
-#     """
-#     return run_query(engine, sql, {"limit": limit})
-
-
-# def get_monthly_trend(
-#     engine: Engine,
-#     start_date: str = "2017-01-01",
-#     end_date: str = "2018-08-01",
-# ) -> pd.DataFrame:
-#     """
-#     Returns monthly revenue aggregated for forecasting.
-#     end_date is exclusive — by default the last (incomplete) month is excluded,
-#     since partial months distort trend/forecast quality.
-#     """
-#     sql = """
-#         SELECT strftime('%Y-%m-01', order_purchase_timestamp) AS ds,
-#                SUM(price) AS y
-#         FROM sales_master
-#         WHERE order_purchase_timestamp >= :start_date
-#           AND order_purchase_timestamp < :end_date
-#         GROUP BY ds
-#         ORDER BY ds
-#     """
-#     df = run_query(engine, sql, {"start_date": start_date, "end_date": end_date})
-#     if df.empty:
-#         raise ValueError("No data returned for monthly trend — check date range.")
-#     df["ds"] = pd.to_datetime(df["ds"])
-#     return df
-
-
-# def get_significant_changes(engine: Engine, threshold: float = 30.0) -> tuple[pd.DataFrame, str]:
-#     """
-#     Detects month-over-month revenue swings per state above `threshold`%.
-#     Excludes the most recent calendar month if it appears incomplete
-#     (heuristic: fewer than 15 distinct order days recorded for it).
-#     Returns (changes_df, month_analyzed).
-#     """
-#     sql = """
-#         SELECT strftime('%Y-%m', order_purchase_timestamp) AS month,
-#                customer_state,
-#                ROUND(SUM(price), 2) AS revenue
-#         FROM sales_master
-#         GROUP BY month, customer_state
-#         ORDER BY month
-#     """
-#     df = run_query(engine, sql)
-#     if df.empty:
-#         raise ValueError("No data available to detect significant changes.")
-
-#     # Heuristic: drop the latest month if it looks incomplete
-#     completeness_sql = """
-#         SELECT strftime('%Y-%m', order_purchase_timestamp) AS month,
-#                COUNT(DISTINCT DATE(order_purchase_timestamp)) AS days_with_orders
-#         FROM sales_master
-#         GROUP BY month
-#         ORDER BY month DESC
-#         LIMIT 1
-#     """
-#     latest_check = run_query(engine, completeness_sql)
-#     if not latest_check.empty and latest_check.iloc[0]["days_with_orders"] < 15:
-#         incomplete_month = latest_check.iloc[0]["month"]
-#         logger.info("Excluding likely-incomplete month: %s", incomplete_month)
-#         df = df[df["month"] != incomplete_month]
-
-#     df["prev_revenue"] = df.groupby("customer_state")["revenue"].shift(1)
-#     df["pct_change"] = ((df["revenue"] - df["prev_revenue"]) / df["prev_revenue"]) * 100
-
-#     latest_month = df["month"].max()
-#     changes = df[
-#         (df["month"] == latest_month) & (df["pct_change"].abs() > threshold)
-#     ].dropna(subset=["pct_change"])
-
-#     return changes, latest_month
-
-
-# # ---------------------------------------------------------------------------
-# # Forecasting
-# # ---------------------------------------------------------------------------
-
-# def get_forecast(monthly_data: pd.DataFrame, periods: int = 3) -> pd.DataFrame:
-#     """
-#     Fits a Prophet model on monthly aggregated data and returns the forecast frame.
-#     Disables daily/weekly seasonality since the input is already monthly-aggregated —
-#     fitting sub-monthly seasonality on monthly data causes spurious overfitting.
-#     """
-#     if len(monthly_data) < 6:
-#         raise ValueError(
-#             f"Only {len(monthly_data)} data points available; "
-#             "need at least 6 months for a minimally stable forecast."
-#         )
-
-#     model = Prophet(
-#         weekly_seasonality=False,
-#         daily_seasonality=False,
-#         yearly_seasonality=len(monthly_data) >= 24,  # only enable if 2+ years of data
-#     )
-#     model.fit(monthly_data)
-
-#     future = model.make_future_dataframe(periods=periods, freq="MS")
-#     forecast = model.predict(future)
-#     return forecast
-
-
-# def evaluate_forecast_holdout(monthly_data: pd.DataFrame, holdout_periods: int = 3) -> dict:
-#     """
-#     Honest out-of-sample evaluation: trains on all but the last `holdout_periods` months,
-#     predicts those held-out months, and compares against actuals.
-#     Returns a dict with MAPE and the comparison table — used to surface real model
-#     performance rather than in-sample (overfit) accuracy.
-#     """
-#     from sklearn.metrics import mean_absolute_percentage_error
-
-#     if len(monthly_data) <= holdout_periods + 3:
-#         raise ValueError("Not enough data to create a meaningful train/holdout split.")
-
-#     train = monthly_data.iloc[:-holdout_periods]
-#     test = monthly_data.iloc[-holdout_periods:]
-
-#     model = Prophet(weekly_seasonality=False, daily_seasonality=False, yearly_seasonality=False)
-#     model.fit(train)
-
-#     future = model.make_future_dataframe(periods=holdout_periods, freq="MS")
-#     forecast = model.predict(future)
-
-#     comparison = test.merge(forecast[["ds", "yhat"]], on="ds")
-#     mape = mean_absolute_percentage_error(comparison["y"], comparison["yhat"])
-
-#     return {
-#         "mape": mape,
-#         "comparison": comparison,
-#         "n_train_months": len(train),
-#         "n_test_months": len(test),
-#     }
-
-
-# # ---------------------------------------------------------------------------
-# # LLM: schema info, NL→SQL, business insights
-# # ---------------------------------------------------------------------------
-
-# @lru_cache(maxsize=1)
-# def get_groq_client() -> Groq:
-#     api_key = os.getenv("GROQ_API_KEY")
-#     if not api_key:
-#         raise EnvironmentError(
-#             "GROQ_API_KEY not found. Check your .env file is in the project root."
-#         )
-#     return Groq(api_key=api_key)
-
-
-# def get_schema_info() -> str:
-#     return """
-# Table name: sales_master
-# Columns:
-# - order_id (text)
-# - customer_id (text)
-# - order_status (text) - typically 'delivered' (table is pre-filtered to delivered orders)
-# - order_purchase_timestamp (datetime, format 'YYYY-MM-DD HH:MM:SS')
-# - price (float) - price of an individual line item
-# - freight_value (float) - shipping cost for that line item
-# - product_category_name (text) - e.g. 'beleza_saude', 'informatica_acessorios'
-# - customer_city (text)
-# - customer_state (text) - two-letter Brazilian state code, e.g. 'SP', 'RJ', 'MG'
-# - payment_type (text) - e.g. 'credit_card', 'boleto', 'voucher'
-# - payment_value (float)
-# """
-
-
-# def is_safe_query(sql: str) -> bool:
-#     """
-#     Basic allowlist-style safety check before executing any LLM-generated SQL.
-#     Only single SELECT statements are permitted; anything else is rejected.
-#     This is a defense-in-depth measure, not a substitute for running with a
-#     read-only DB user in a real production deployment.
-#     """
-#     if not sql or not sql.strip():
-#         return False
-
-#     cleaned = sql.strip().rstrip(";")
-#     if ";" in cleaned:
-#         return False  # block stacked queries
-
-#     upper = cleaned.upper()
-#     if not upper.startswith("SELECT"):
-#         return False
-
-#     return not any(keyword in upper for keyword in FORBIDDEN_SQL_KEYWORDS)
-
-
-# def natural_language_to_sql(question: str, client: Groq) -> str:
-#     """
-#     Converts a natural-language question into a SQLite SQL query using the LLM.
-#     Returns the literal string 'NOT_RELEVANT' if the question is unrelated
-#     to the sales dataset, so the caller can short-circuit before hitting the DB.
-#     """
-#     schema = get_schema_info()
-#     prompt = f"""You are a SQL expert. Given this SQLite table schema:
-# {schema}
-
-# Convert this question into a single valid SQLite SQL query: "{question}"
-
-# Rules:
-# - If the question is NOT related to e-commerce sales data (general knowledge, current events,
-#   sports, anything outside this schema), respond with exactly: NOT_RELEVANT
-# - Return ONLY the SQL query, no explanation, no markdown, no backticks
-# - Use proper SQLite syntax
-# - Always include the aggregated/calculated column (COUNT, SUM, AVG, etc.) in the SELECT
-#   clause itself, not only in ORDER BY
-# - Always add LIMIT 20 unless the question asks for a single aggregated value
-# - Only SELECT statements are allowed — never INSERT/UPDATE/DELETE/DROP/ALTER
-# """
-#     try:
-#         response = client.chat.completions.create(
-#             model=GROQ_MODEL,
-#             messages=[{"role": "user", "content": prompt}],
-#             temperature=0,
-#             timeout=20,
-#         )
-#     except GroqError as e:
-#         logger.error("Groq API call failed: %s", e)
-#         raise InsightGenerationError(f"LLM request failed: {e}") from e
-
-#     sql = response.choices[0].message.content.strip()
-#     sql = sql.replace("```sql", "").replace("```", "").strip()
-#     return sql
-
-
-# def ask_data_question(question: str, engine: Engine, client: Groq) -> dict:
-#     """
-#     Full pipeline for the 'Ask Your Data' feature:
-#     NL question -> SQL -> safety check -> execution -> structured result.
-#     Centralizing this here keeps app.py free of business logic.
-#     Returns a dict: {status, sql, data (DataFrame or None), message}
-#     """
-#     sql = natural_language_to_sql(question, client)
-
-#     if sql == "NOT_RELEVANT":
-#         return {"status": "not_relevant", "sql": None, "data": None,
-#                 "message": "This question doesn't relate to the sales dataset."}
-
-#     if not is_safe_query(sql):
-#         logger.warning("Blocked unsafe generated query: %s", sql)
-#         return {"status": "unsafe", "sql": sql, "data": None,
-#                 "message": "Generated query failed the safety check."}
-
-#     try:
-#         result = run_query(engine, sql)
-#     except Exception as e:
-#         return {"status": "error", "sql": sql, "data": None,
-#                 "message": f"Query execution failed: {e}"}
-
-#     return {"status": "ok", "sql": sql, "data": result, "message": None}
-
-
-# def generate_ai_insight(changes_df: pd.DataFrame, month: str, client: Groq) -> str:
-#     """
-#     Sends detected month-over-month anomalies to the LLM and returns a
-#     stakeholder-ready business insight summary in plain English.
-#     """
-#     if changes_df.empty:
-#         return "No significant month-over-month changes were detected for this period."
-
-#     changes_text = changes_df[["customer_state", "revenue", "pct_change"]].to_string(index=False)
-
-#     confidence_note = ""
-#     if len(changes_df) < 3:
-#         confidence_note = (
-#             "\nNote: only a small number of states show significant change this month — "
-#             "treat conclusions as directional, not definitive."
-#         )
-
-#     prompt = f"""You are a business data analyst. Below is data showing month-over-month
-# revenue changes (%) by state for an e-commerce company, for the month of {month}.
-
-# {changes_text}
-# {confidence_note}
-
-# Write a concise business insight summary (4-5 bullet points) highlighting:
-# 1. The most significant growth states and possible business implications
-# 2. Any concerning declines
-# 3. One actionable recommendation for the business
-
-# Keep it professional and data-driven, suitable for a business stakeholder report."""
-
-#     try:
-#         response = client.chat.completions.create(
-#             model=GROQ_MODEL,
-#             messages=[{"role": "user", "content": prompt}],
-#             temperature=0.3,
-#             timeout=20,
-#         )
-#     except GroqError as e:
-#         logger.error("Groq API call failed: %s", e)
-#         raise InsightGenerationError(f"LLM request failed: {e}") from e
-
-#     return response.choices[0].message.content
 """
 data_utils.py
 =============
@@ -412,8 +9,35 @@ Responsibilities
 - Analytics queries: KPIs, categories, states, payment mix, cohorts,
   delivery metrics, review sentiment, revenue heatmap
 - Time-series forecasting with Prophet (fit + holdout evaluation)
-- LLM integration: NL→SQL translation and AI business-insight generation
-  via Groq (Llama 3.3 70B), with exponential-backoff retry
+- LLM integration: a business-semantics-aware NL -> SQL engine and
+  AI business-insight generation via Groq (GPT-OSS 120B), with
+  exponential-backoff retry
+
+NL -> SQL engine (v2)
+----------------------
+The naive "translate English to SQL" approach produces SQL that is
+syntactically valid but semantically wrong (e.g. counting `customer_id`
+instead of `customer_unique_id`, treating `payment_value` as revenue).
+This module fixes that with a multi-stage pipeline:
+
+    1. Ambiguity detection   -- refuse to guess; ask a clarifying question.
+    2. Intent detection      -- common analytics questions are answered with
+                                 a deterministic, pre-written SQL template.
+                                 No LLM call, zero hallucination risk.
+    3. LLM generation        -- only for questions that don't match a known
+                                 intent. The prompt is loaded with a full
+                                 business dictionary and hard business rules.
+    4. Business-rule fixes   -- a regex safety net that auto-corrects known
+                                 mistakes (customer_id misuse, payment_value
+                                 used as revenue) before execution.
+    5. Self-review           -- a second, independent LLM pass audits the
+                                 SQL against the same rules and can rewrite
+                                 it again.
+    6. Schema validation     -- rejects SQL referencing unknown tables.
+    7. Safety check          -- existing allowlist validator (SELECT-only).
+    8. Confidence scoring    -- 0-100, based on how much correction was
+                                 required to reach a clean query.
+    9. Execution              -- against the live database.
 
 Design principles
 -----------------
@@ -422,7 +46,7 @@ Design principles
   logged, and surfaced consistently.
 - The Groq client and SQLAlchemy engine are each created once and cached;
   Streamlit reruns do not create duplicate connections.
-- No business logic lives in app.py — only presentation.
+- No business logic lives in app.py -- only presentation.
 
 Author : Sales Pulse AI
 """
@@ -431,6 +55,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from functools import lru_cache
 from typing import Optional
@@ -470,6 +95,18 @@ FORBIDDEN_SQL_KEYWORDS: tuple[str, ...] = (
 # Groq retry settings
 _GROQ_MAX_RETRIES: int = 3
 _GROQ_BACKOFF_BASE: float = 1.5   # seconds; wait = base ** attempt
+
+# Prophet tuning -- validated in 01_data_exploration.ipynb:
+#   default changepoint_prior_scale (0.05) -> 35.94% out-of-sample MAPE
+#   changepoint_prior_scale=0.5            -> 27.10% out-of-sample MAPE
+# This constant is the single source of truth so the production forecast
+# and the holdout-accuracy panel always evaluate the SAME model.
+FORECAST_CHANGEPOINT_PRIOR_SCALE: float = 0.5
+
+# Monthly trend default window -- matches the notebook's validated range
+# (Jan 2017 through Aug 2018 inclusive, i.e. exclusive upper bound of Sep 2018).
+DEFAULT_TREND_START: str = "2017-01-01"
+DEFAULT_TREND_END: str = "2018-09-01"
 
 
 # ---------------------------------------------------------------------------
@@ -603,21 +240,43 @@ def get_kpi_summary(engine: Engine) -> dict:
     """
     Compute top-level KPI metrics for the summary strip on the dashboard.
 
+    Notes
+    -----
+    ``avg_order_value`` is computed at the ORDER level: line items are first
+    summed per ``order_id``, then those order totals are averaged. A naive
+    ``AVG(price)`` across line items understates true AOV whenever an order
+    contains more than one item (this dataset averages ~1.15 items/order),
+    because it is an average of item prices, not order totals.
+
+    ``total_customers`` uses ``customer_unique_id`` (the real-person
+    identifier), not ``customer_id`` (which is generated per-order in this
+    dataset and would make every customer look unique every time).
+
     Returns
     -------
     dict
         Keys: ``total_revenue``, ``total_orders``, ``avg_order_value``,
         ``total_customers``, ``top_state``, ``top_category``.
     """
-    sql = """
+    base_sql = """
         SELECT
-            ROUND(SUM(price), 2)                    AS total_revenue,
-            COUNT(DISTINCT order_id)                AS total_orders,
-            ROUND(AVG(price), 2)                    AS avg_order_value,
-            COUNT(DISTINCT customer_unique_id)             AS total_customers
+            ROUND(SUM(price), 2)               AS total_revenue,
+            COUNT(DISTINCT order_id)           AS total_orders,
+            COUNT(DISTINCT customer_unique_id) AS total_customers
         FROM sales_master
     """
-    base = run_query(engine, sql)
+    base = run_query(engine, base_sql)
+
+    # Order-level AOV: sum items per order first, then average across orders.
+    aov_sql = """
+        SELECT ROUND(AVG(order_total), 2) AS avg_order_value
+        FROM (
+            SELECT order_id, SUM(price) AS order_total
+            FROM sales_master
+            GROUP BY order_id
+        )
+    """
+    aov = run_query(engine, aov_sql)
 
     top_state_df = run_query(
         engine,
@@ -634,7 +293,7 @@ def get_kpi_summary(engine: Engine) -> dict:
     return {
         "total_revenue":    float(row["total_revenue"] or 0),
         "total_orders":     int(row["total_orders"] or 0),
-        "avg_order_value":  float(row["avg_order_value"] or 0),
+        "avg_order_value":  float(aov.iloc[0]["avg_order_value"] or 0),
         "total_customers":  int(row["total_customers"] or 0),
         "top_state":        top_state_df.iloc[0, 0] if not top_state_df.empty else "N/A",
         "top_category":     top_cat_df.iloc[0, 0] if not top_cat_df.empty else "N/A",
@@ -706,21 +365,26 @@ def get_state_revenue(engine: Engine, limit: int = 10) -> pd.DataFrame:
 
 def get_monthly_trend(
     engine: Engine,
-    start_date: str = "2017-01-01",
-    end_date: str = "2018-08-01",
+    start_date: str = DEFAULT_TREND_START,
+    end_date: str = DEFAULT_TREND_END,
 ) -> pd.DataFrame:
     """
     Aggregate revenue by calendar month for time-series forecasting.
 
-    The *end_date* is exclusive; by default the last (likely incomplete) month
-    in the dataset is excluded to avoid distorting the trend line.
+    The *end_date* is exclusive. Defaults match the range validated in
+    01_data_exploration.ipynb (Jan 2017 through Aug 2018 inclusive — i.e.
+    an exclusive upper bound of 2018-09-01). The dataset's last calendar
+    month with meaningful order volume is August 2018; excluding it (as an
+    earlier default of "2018-08-01" did) silently drops a full month of
+    training data and shifts the holdout-evaluation window out of sync with
+    the notebook's validated results.
 
     Parameters
     ----------
     engine : Engine
     start_date : str, default ``"2017-01-01"``
         Inclusive lower bound (ISO 8601 date string).
-    end_date : str, default ``"2018-08-01"``
+    end_date : str, default ``"2018-09-01"``
         Exclusive upper bound.
 
     Returns
@@ -780,7 +444,7 @@ def get_payment_breakdown(engine: Engine) -> pd.DataFrame:
 
 def get_revenue_heatmap_data(engine: Engine) -> pd.DataFrame:
     """
-    Build a state × month revenue matrix suitable for a heatmap visualisation.
+    Build a state x month revenue matrix suitable for a heatmap visualisation.
 
     Returns
     -------
@@ -901,13 +565,16 @@ def get_delivery_metrics(engine: Engine) -> dict:
 
 def get_review_score_distribution(engine: Engine) -> pd.DataFrame:
     """
-    Return the distribution of customer review scores (1–5).
+    Return the distribution of customer review scores (1-5).
 
     Returns
     -------
     pd.DataFrame
         Columns: ``review_score``, ``count``, ``share_pct``.
-        Returns an empty DataFrame if ``review_score`` is not in the schema.
+        Returns an empty DataFrame if ``review_score`` is not in the schema
+        (the current pipeline does not join ``olist_order_reviews_dataset.csv``
+        into ``sales_master`` — this function degrades gracefully rather than
+        erroring until that join is added).
     """
     sample = run_query(engine, "SELECT * FROM sales_master LIMIT 1")
     if "review_score" not in sample.columns:
@@ -1051,6 +718,7 @@ def get_significant_changes(
 def get_forecast(
     monthly_data: pd.DataFrame,
     periods: int = 3,
+    changepoint_prior_scale: float = FORECAST_CHANGEPOINT_PRIOR_SCALE,
 ) -> pd.DataFrame:
     """
     Fit a Prophet model on monthly revenue and return a forecast frame.
@@ -1060,12 +728,23 @@ def get_forecast(
     spans at least two full years, which is the minimum for Prophet to learn
     a reliable annual pattern.
 
+    ``changepoint_prior_scale`` defaults to 0.5 rather than Prophet's own
+    default of 0.05 — this value was empirically validated in
+    01_data_exploration.ipynb, where it reduced out-of-sample MAPE from
+    35.94% to 27.10% on a 3-month holdout. It is exposed as a parameter
+    (rather than hard-coded) so :func:`evaluate_forecast_holdout` can be
+    called with the exact same setting the production model uses, keeping
+    the reported accuracy panel honest about what's actually being served.
+
     Parameters
     ----------
     monthly_data : pd.DataFrame
         Must contain columns ``ds`` (datetime) and ``y`` (float).
     periods : int, default 3
         Number of future months to forecast.
+    changepoint_prior_scale : float, default 0.5
+        Prophet trend-flexibility parameter. Higher values allow the trend
+        to bend more sharply at changepoints.
 
     Returns
     -------
@@ -1089,6 +768,7 @@ def get_forecast(
         weekly_seasonality=False,
         daily_seasonality=False,
         yearly_seasonality=(len(monthly_data) >= 24),
+        changepoint_prior_scale=changepoint_prior_scale,
         interval_width=0.80,
     )
     model.fit(monthly_data)
@@ -1100,6 +780,7 @@ def get_forecast(
 def evaluate_forecast_holdout(
     monthly_data: pd.DataFrame,
     holdout_periods: int = 3,
+    changepoint_prior_scale: float = FORECAST_CHANGEPOINT_PRIOR_SCALE,
 ) -> dict:
     """
     Honest out-of-sample evaluation using a simple train/holdout split.
@@ -1108,12 +789,20 @@ def evaluate_forecast_holdout(
     then compares predictions against the actual held-out values.  This gives
     a realistic accuracy estimate instead of an in-sample (overfit) metric.
 
+    Uses the same ``changepoint_prior_scale`` as the production model
+    (:func:`get_forecast`) by default, so the MAPE shown on the dashboard
+    reflects the model that is actually generating the forecast — not a
+    different, untuned model.
+
     Parameters
     ----------
     monthly_data : pd.DataFrame
         Columns: ``ds`` (datetime), ``y`` (float).
     holdout_periods : int, default 3
         Number of trailing months to withhold from training.
+    changepoint_prior_scale : float, default 0.5
+        Must match the value passed to :func:`get_forecast` for the
+        evaluation to be representative of production behaviour.
 
     Returns
     -------
@@ -1141,6 +830,7 @@ def evaluate_forecast_holdout(
         weekly_seasonality=False,
         daily_seasonality=False,
         yearly_seasonality=False,
+        changepoint_prior_scale=changepoint_prior_scale,
     )
     model.fit(train)
 
@@ -1159,7 +849,7 @@ def evaluate_forecast_holdout(
 
 
 # ---------------------------------------------------------------------------
-# LLM helpers
+# LLM plumbing (shared by insights + NL->SQL)
 # ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=1)
@@ -1200,7 +890,7 @@ def _groq_chat(
     messages : list[dict]
         OpenAI-style message list.
     temperature : float, default 0.0
-    max_tokens : int, default 1024
+    max_tokens : int, default 2048
 
     Returns
     -------
@@ -1222,6 +912,17 @@ def _groq_chat(
             wait = _GROQ_BACKOFF_BASE ** attempt
             logger.warning(
                 "Groq API error (attempt %d/%d): %s — retrying in %.1fs",
+                attempt + 1, _GROQ_MAX_RETRIES, exc, wait,
+            )
+            last_exc = exc
+            time.sleep(wait)
+        except Exception as exc:
+            # Non-GroqError transient failures (network hiccups, timeouts
+            # raised by the underlying HTTP client) get the same retry
+            # treatment instead of bubbling straight up uncaught.
+            wait = _GROQ_BACKOFF_BASE ** attempt
+            logger.warning(
+                "Unexpected error calling Groq (attempt %d/%d): %s — retrying in %.1fs",
                 attempt + 1, _GROQ_MAX_RETRIES, exc, wait,
             )
             last_exc = exc
@@ -1248,21 +949,369 @@ def get_schema_info() -> str:
     return """
 Table: sales_master
 Description: Delivered e-commerce orders from the Olist Brazilian marketplace.
+Grain: one row per (order, line item) — an order with 3 items produces 3 rows
+       sharing the same order_id.
 
 Columns
 -------
-order_id                   TEXT     — Unique order identifier
-customer_id                TEXT     — Unique customer identifier
-order_status               TEXT     — Always 'delivered' (table is pre-filtered)
-order_purchase_timestamp   DATETIME — When the order was placed ('YYYY-MM-DD HH:MM:SS')
-price                      REAL     — Unit price of one line item (BRL)
-freight_value              REAL     — Shipping cost for that line item (BRL)
-product_category_name      TEXT     — English category name, e.g. 'health_beauty'
-customer_city              TEXT     — Customer's city
-customer_state             TEXT     — Two-letter Brazilian state code, e.g. 'SP', 'RJ'
-payment_type               TEXT     — 'credit_card', 'boleto', 'voucher', 'debit_card'
-payment_value              REAL     — Total payment for the order (BRL)
+order_id                   TEXT     — Order identifier (repeats across line items)
+customer_id                TEXT     — Per-ORDER customer identifier (technical, NOT a person)
+customer_unique_id          TEXT     — Per-PERSON customer identifier (the real customer)
+order_status                TEXT     — Always 'delivered' (table is pre-filtered)
+order_purchase_timestamp    DATETIME — When the order was placed ('YYYY-MM-DD HH:MM:SS')
+price                       REAL     — Unit price of one line item (BRL) — this IS revenue
+freight_value                REAL     — Shipping cost for that line item (BRL)
+product_category_name       TEXT     — English category name, e.g. 'health_beauty'
+customer_city                TEXT     — Customer's city
+customer_state               TEXT     — Two-letter Brazilian state code, e.g. 'SP', 'RJ'
+payment_type                 TEXT     — 'credit_card', 'boleto', 'voucher', 'debit_card'
+payment_value                 REAL     — Payment TRANSACTION amount (not the same as revenue)
 """.strip()
+
+
+# ---------------------------------------------------------------------------
+# NL -> SQL: Business Dictionary & Semantic Layer
+# ---------------------------------------------------------------------------
+
+# The only table/columns the LLM (and the validator) are allowed to reference.
+KNOWN_TABLES: frozenset[str] = frozenset({"sales_master"})
+
+KNOWN_COLUMNS: frozenset[str] = frozenset({
+    "order_id", "customer_id", "customer_unique_id", "order_status",
+    "order_purchase_timestamp", "price", "freight_value",
+    "product_category_name", "customer_city", "customer_state",
+    "payment_type", "payment_value",
+})
+
+BUSINESS_DICTIONARY: str = """
+BUSINESS DICTIONARY — sales_master
+===================================
+order_id                 -> One order. Multiple rows share an order_id when an
+                             order has several line items. Use
+                             COUNT(DISTINCT order_id) to count orders.
+customer_id                -> A TECHNICAL, PER-ORDER identifier. In this dataset
+                             every order gets its own customer_id, even for the
+                             same real person. NEVER use customer_id to count
+                             customers, measure repeat purchases, or do ANY
+                             customer-level analytics.
+customer_unique_id           -> The REAL PERSON identifier. ALWAYS use this column
+                             for unique customer counts, repeat-customer
+                             analysis, customer cohorts, or any question about
+                             "how many customers".
+price                        -> The selling price of ONE line item. This is the
+                             business definition of REVENUE in this project:
+                                 Revenue = SUM(price)
+                             NOT payment_value.
+freight_value                 -> Shipping cost for that line item. Not part of revenue.
+payment_value                  -> The amount recorded in a PAYMENT TRANSACTION for an
+                             order. Can differ from order revenue (installments,
+                             rounding, split payments). NEVER use payment_value
+                             to answer a "revenue" question — only use it when
+                             the user explicitly asks about payments or
+                             transaction amounts.
+customer_state                -> Two-letter Brazilian state code (customer location).
+customer_city                  -> Customer's city.
+product_category_name          -> Product category (English translated name).
+payment_type                    -> 'credit_card', 'boleto', 'voucher', 'debit_card'.
+order_purchase_timestamp        -> When the order was placed. Use
+                             strftime('%Y-%m', order_purchase_timestamp) to
+                             group by month.
+order_status                     -> Always 'delivered' in this table.
+
+AVERAGE ORDER VALUE (AOV) must be computed at the ORDER level — sum items per
+order first, then average the order totals:
+    SELECT AVG(order_total) FROM (
+        SELECT order_id, SUM(price) AS order_total
+        FROM sales_master GROUP BY order_id
+    )
+A flat AVG(price) across line items is WRONG — it averages item prices, not
+order totals, and understates AOV whenever orders contain multiple items.
+""".strip()
+
+BUSINESS_RULES: str = """
+HARD BUSINESS RULES (never violate these):
+1. Unique / total customers -> COUNT(DISTINCT customer_unique_id). Never customer_id.
+2. Order count -> COUNT(DISTINCT order_id).
+3. Repeat customers -> GROUP BY customer_unique_id, HAVING COUNT(DISTINCT order_id) > 1.
+4. Any customer-level analytics question -> always customer_unique_id, never customer_id.
+5. Revenue -> SUM(price). Never payment_value, unless the question explicitly
+   asks about payments or transactions.
+6. Average Order Value -> the order-level AOV formula above, never a flat
+   AVG(price) across line items.
+7. SQL dialect: SQLite only.
+8. Never invent tables. The only table available is sales_master.
+9. Never invent columns. Only use columns listed in the business dictionary.
+10. Always include every aggregated value (SUM, COUNT, AVG, etc.) directly in
+    the SELECT clause — never reference an alias only in ORDER BY.
+11. Add LIMIT 20 unless the question clearly asks for a single aggregated value.
+12. Return ONLY the raw SQL statement. No markdown, no backticks, no explanation.
+""".strip()
+
+
+def _order_level_aov_sql() -> str:
+    """SQL template implementing the order-level AOV business rule."""
+    return (
+        "SELECT ROUND(AVG(order_total), 2) AS avg_order_value FROM ("
+        "SELECT order_id, SUM(price) AS order_total FROM sales_master GROUP BY order_id"
+        ")"
+    )
+
+
+# ---------------------------------------------------------------------------
+# NL -> SQL: Intent templates
+#
+# Each entry matches a common analytics question via regex and returns a
+# pre-written, business-rule-correct SQL template. Templated answers never
+# touch the LLM, so they carry zero hallucination risk and get the highest
+# confidence score.
+# ---------------------------------------------------------------------------
+
+INTENT_TEMPLATES: list[dict] = [
+    {
+        "name": "unique_customers",
+        "patterns": [r"\bunique\s+customers?\b", r"\bhow many customers\b", r"\btotal customers?\b",
+                     r"\bnumber of customers\b"],
+        "exclude": [r"\brepeat\b", r"\breturning\b", r"\bby\s+(state|month|category)\b"],
+        "sql": "SELECT COUNT(DISTINCT customer_unique_id) AS unique_customers FROM sales_master",
+        "reasoning": "Matched the 'unique customers' intent template (COUNT DISTINCT customer_unique_id, per business rule).",
+    },
+    {
+        "name": "repeat_customers",
+        "patterns": [r"\brepeat customers?\b", r"\breturning customers?\b"],
+        "exclude": [r"\bby\s+(state|month|category)\b", r"\btrend\b"],
+        "sql": (
+            "SELECT COUNT(*) AS repeat_customers FROM ("
+            "SELECT customer_unique_id FROM sales_master "
+            "GROUP BY customer_unique_id HAVING COUNT(DISTINCT order_id) > 1"
+            ")"
+        ),
+        "reasoning": "Matched the 'repeat customers' intent template (grouped by customer_unique_id).",
+    },
+    {
+        "name": "total_orders",
+        "patterns": [r"\btotal (number of )?orders?\b", r"\bhow many orders\b"],
+        "exclude": [r"\bby\s+(state|month|category)\b"],
+        "sql": "SELECT COUNT(DISTINCT order_id) AS total_orders FROM sales_master",
+        "reasoning": "Matched the 'total orders' intent template (COUNT DISTINCT order_id).",
+    },
+    {
+        "name": "total_revenue",
+        "patterns": [r"\btotal revenue\b", r"\boverall revenue\b", r"^\s*revenue\s*\??\s*$",
+                     r"\bwhat is (the )?revenue\b"],
+        "exclude": [r"\bby\b", r"\bper\b", r"\btrend\b", r"\bmonth\b", r"\bcategory\b",
+                    r"\bstate\b", r"\bpayment\b"],
+        "sql": "SELECT ROUND(SUM(price), 2) AS total_revenue FROM sales_master",
+        "reasoning": "Matched the 'total revenue' intent template (SUM(price), per business rule — not payment_value).",
+    },
+    {
+        "name": "avg_order_value",
+        "patterns": [r"\baverage order value\b", r"\bavg\.? order value\b", r"\baov\b"],
+        "exclude": [],
+        "sql": _order_level_aov_sql(),
+        "reasoning": "Matched the 'average order value' intent template (order-level AOV subquery, per business rule).",
+    },
+    {
+        "name": "top_categories",
+        "patterns": [r"\btop\s*\d*\s*(product )?categor(y|ies)\b", r"\bbest.?selling categor"],
+        "exclude": [],
+        "sql": (
+            "SELECT product_category_name, ROUND(SUM(price), 2) AS total_revenue, "
+            "COUNT(DISTINCT order_id) AS total_orders FROM sales_master "
+            "GROUP BY product_category_name ORDER BY total_revenue DESC LIMIT {limit}"
+        ),
+        "reasoning": "Matched the 'top categories' intent template (revenue-ranked category breakdown).",
+    },
+    {
+        "name": "top_states",
+        "patterns": [r"\btop\s*\d*\s*states?\b", r"\bstate.*(highest|most) revenue\b",
+                     r"\bwhich state\b.*revenue\b"],
+        "exclude": [],
+        "sql": (
+            "SELECT customer_state, ROUND(SUM(price), 2) AS total_revenue, "
+            "COUNT(DISTINCT order_id) AS total_orders FROM sales_master "
+            "GROUP BY customer_state ORDER BY total_revenue DESC LIMIT {limit}"
+        ),
+        "reasoning": "Matched the 'top states' intent template (revenue-ranked state breakdown).",
+    },
+    {
+        "name": "monthly_revenue",
+        "patterns": [r"\bmonthly revenue\b", r"\brevenue.*(trend|by month|per month)\b",
+                     r"\bmonth.*revenue\b"],
+        "exclude": [],
+        "sql": (
+            "SELECT strftime('%Y-%m', order_purchase_timestamp) AS month, "
+            "ROUND(SUM(price), 2) AS revenue FROM sales_master "
+            "GROUP BY month ORDER BY month LIMIT 24"
+        ),
+        "reasoning": "Matched the 'monthly revenue trend' intent template (month-grouped SUM(price)).",
+    },
+    {
+        "name": "payment_mix",
+        "patterns": [r"\bpayment (type|mix|method)s?\b", r"\bhow (do|does) customers? pay\b"],
+        "exclude": [],
+        "sql": (
+            "SELECT payment_type, ROUND(SUM(price), 2) AS total_revenue, "
+            "COUNT(DISTINCT order_id) AS total_orders FROM sales_master "
+            "GROUP BY payment_type ORDER BY total_revenue DESC"
+        ),
+        "reasoning": "Matched the 'payment mix' intent template (revenue by payment_type).",
+    },
+]
+
+
+def detect_intent(question: str) -> Optional[dict]:
+    """
+    Match *question* against known analytics intents.
+
+    Parameters
+    ----------
+    question : str
+
+    Returns
+    -------
+    dict | None
+        The matching entry from :data:`INTENT_TEMPLATES`, or ``None`` if no
+        intent matched (the question should fall through to the LLM).
+    """
+    q = question.lower()
+    for tmpl in INTENT_TEMPLATES:
+        matched = any(re.search(p, q) for p in tmpl["patterns"])
+        excluded = any(re.search(p, q) for p in tmpl.get("exclude", []))
+        if matched and not excluded:
+            return tmpl
+    return None
+
+
+def _extract_limit(question: str, default: int = 10) -> int:
+    """Pull a 'top N' style limit out of the question text, clamped to [1, 50]."""
+    match = re.search(r"\btop\s+(\d+)\b", question.lower())
+    if match:
+        try:
+            return max(1, min(int(match.group(1)), 50))
+        except ValueError:
+            pass
+    return default
+
+
+# ---------------------------------------------------------------------------
+# NL -> SQL: Ambiguity detection
+# ---------------------------------------------------------------------------
+
+AMBIGUOUS_PATTERNS: list[dict] = [
+    {
+        "trigger": r"\brevenue\b",
+        "unless": [r"\bby\b", r"\bper\b", r"\btotal\b", r"\boverall\b", r"\btrend\b",
+                   r"\bmonth\b", r"\bcategory\b", r"\bstate\b", r"\bpayment\b",
+                   r"\bwhat is\b"],
+        "clarification": (
+            "Which cut of revenue do you want — total revenue, revenue by category, "
+            "revenue by state, monthly revenue trend, or revenue by payment type?"
+        ),
+    },
+    {
+        "trigger": r"\bcustomers?\b",
+        "unless": [r"\bunique\b", r"\btotal\b", r"\brepeat\b", r"\breturning\b",
+                   r"\bnew\b", r"\bhow many\b", r"\bby\b", r"\bper\b", r"\btop\b",
+                   r"\bstate\b", r"\bnumber of\b"],
+        "clarification": (
+            "Which angle on customers — unique customer count, repeat customers, "
+            "new vs. returning, or customers broken down by state?"
+        ),
+    },
+]
+
+
+def detect_ambiguity(question: str) -> Optional[str]:
+    """
+    Flag genuinely underspecified questions instead of letting the LLM guess.
+
+    Parameters
+    ----------
+    question : str
+
+    Returns
+    -------
+    str | None
+        A clarifying question to show the user, or ``None`` if the question
+        is specific enough to proceed.
+    """
+    q = question.lower()
+    for rule in AMBIGUOUS_PATTERNS:
+        if re.search(rule["trigger"], q) and not any(re.search(p, q) for p in rule["unless"]):
+            return rule["clarification"]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# NL -> SQL: Business-rule auto-fix layer (regex safety net)
+# ---------------------------------------------------------------------------
+
+def apply_business_rule_fixes(sql: str, question: str) -> tuple[str, list[str]]:
+    """
+    Auto-correct known business-rule violations in LLM-generated SQL.
+
+    This is a deterministic safety net that runs regardless of whether the
+    LLM followed the prompt's business rules. It catches the two most common
+    failure modes seen in production: counting ``customer_id`` instead of
+    ``customer_unique_id``, and treating ``payment_value`` as revenue.
+
+    Parameters
+    ----------
+    sql : str
+        Raw SQL returned by the LLM.
+    question : str
+        Original natural-language question (used to decide which fixes apply).
+
+    Returns
+    -------
+    tuple[str, list[str]]
+        ``(corrected_sql, list_of_fix_descriptions)``. The list is empty if
+        no fix was needed.
+    """
+    fixes: list[str] = []
+    fixed = sql
+    q_lower = question.lower()
+
+    # Rule: customer-level analytics must use customer_unique_id.
+    if re.search(r"\bcustomers?\b", q_lower) and re.search(r"\bcustomer_id\b", fixed) \
+            and "customer_unique_id" not in fixed:
+        fixed = re.sub(r"\bcustomer_id\b", "customer_unique_id", fixed)
+        fixes.append("Rewrote customer_id -> customer_unique_id (customer analytics must use the real-person ID).")
+
+    # Rule: "revenue" questions must use price, not payment_value.
+    if re.search(r"\brevenue\b", q_lower) and re.search(r"\bpayment_value\b", fixed, re.IGNORECASE):
+        fixed = re.sub(r"\bpayment_value\b", "price", fixed, flags=re.IGNORECASE)
+        fixes.append("Rewrote payment_value -> price (this project defines revenue as SUM(price)).")
+
+    return fixed, fixes
+
+
+def validate_sql_schema(sql: str) -> list[str]:
+    """
+    Check that *sql* only references known tables.
+
+    A full column-level parse is out of scope for a regex-based validator,
+    so this focuses on the highest-value, cheapest check: table names.
+    Any invented/unknown column will still surface immediately as a clear
+    SQLite "no such column" error at execution time, so it is not silently
+    swallowed even though this validator doesn't catch it up front.
+
+    Parameters
+    ----------
+    sql : str
+
+    Returns
+    -------
+    list[str]
+        Human-readable validation issues. Empty if the SQL looks clean.
+    """
+    issues: list[str] = []
+    referenced = set(re.findall(r"\bFROM\s+([A-Za-z_]\w*)", sql, re.IGNORECASE)) | \
+                 set(re.findall(r"\bJOIN\s+([A-Za-z_]\w*)", sql, re.IGNORECASE))
+    unknown = {t for t in referenced if t.lower() not in KNOWN_TABLES}
+    if unknown:
+        issues.append(f"References unknown table(s): {', '.join(sorted(unknown))}")
+    return issues
 
 
 def is_safe_query(sql: str) -> bool:
@@ -1296,9 +1345,18 @@ def is_safe_query(sql: str) -> bool:
     return not any(kw in upper for kw in FORBIDDEN_SQL_KEYWORDS)
 
 
+# ---------------------------------------------------------------------------
+# NL -> SQL: LLM generation + self-review
+# ---------------------------------------------------------------------------
+
 def natural_language_to_sql(question: str, client: Groq) -> str:
     """
     Translate a natural-language question into a valid SQLite SELECT query.
+
+    The prompt is loaded with the schema, the business dictionary, and the
+    hard business rules so the model is told the MEANING of each column, not
+    just its name — this is what fixes semantically-wrong-but-syntactically-
+    valid SQL (e.g. COUNT(customer_id) for "unique customers").
 
     Returns the sentinel string ``'NOT_RELEVANT'`` when the question is
     unrelated to the sales dataset, so the caller can skip DB execution
@@ -1317,37 +1375,131 @@ def natural_language_to_sql(question: str, client: Groq) -> str:
         A SQLite SELECT statement, or ``'NOT_RELEVANT'``.
     """
     schema = get_schema_info()
-    prompt = f"""You are an expert SQLite data analyst embedded in a business analytics tool.
+    prompt = f"""You are an expert SQLite data analyst embedded in a business analytics tool
+for a Brazilian e-commerce company (the Olist dataset).
 
 SCHEMA
 ------
 {schema}
 
+{BUSINESS_DICTIONARY}
+
+{BUSINESS_RULES}
+
 TASK
 ----
-Convert the user question below into a single valid SQLite SELECT query.
-
-RULES
------
-1. If the question is NOT related to e-commerce sales data (e.g. general knowledge,
-   current events, coding help, anything outside the schema above), respond with
-   exactly the word: NOT_RELEVANT
-2. Return ONLY the raw SQL — no markdown, no backticks, no explanation.
-3. Use only columns and tables that exist in the schema above.
-4. Always include every aggregated value (SUM, COUNT, AVG, etc.) in the SELECT
-   clause — never reference an alias only in ORDER BY.
-5. Add LIMIT 20 unless the question clearly asks for a single aggregated value.
-6. Only SELECT is allowed. Never use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE,
-   TRUNCATE, ATTACH, PRAGMA, or REPLACE.
-7. Use strftime('%Y-%m', order_purchase_timestamp) for month-level grouping.
+Convert the user question below into a single valid SQLite SELECT query,
+strictly following the business dictionary and hard rules above. If the
+question is NOT related to e-commerce sales data (general knowledge, current
+events, coding help, anything outside this schema), respond with exactly:
+NOT_RELEVANT
 
 USER QUESTION: "{question}"
 """
     raw = _groq_chat(client, [{"role": "user", "content": prompt}], temperature=0)
-    # Strip any accidental markdown code fences
     sql = raw.replace("```sql", "").replace("```", "").strip()
     return sql
 
+
+def self_review_sql(sql: str, question: str, client: Groq) -> tuple[str, bool]:
+    """
+    Second, independent LLM pass that audits SQL against the business rules.
+
+    Runs as a business-rule sanity check separate from the generation call —
+    a fresh pass is more likely to catch a violation than asking the same
+    call to grade its own work. If Groq is unavailable, this degrades
+    gracefully to a no-op rather than blocking the whole pipeline.
+
+    Parameters
+    ----------
+    sql : str
+        SQL to review (ideally already passed through
+        :func:`apply_business_rule_fixes`).
+    question : str
+        Original natural-language question, for context.
+    client : Groq
+
+    Returns
+    -------
+    tuple[str, bool]
+        ``(possibly_corrected_sql, was_changed)``.
+    """
+    review_prompt = f"""You are a strict SQL reviewer for a SQLite analytics database.
+
+{BUSINESS_DICTIONARY}
+
+{BUSINESS_RULES}
+
+USER QUESTION: "{question}"
+
+SQL TO REVIEW:
+{sql}
+
+Check ONLY for business-rule violations (not style or formatting). If the SQL
+is fully compliant, respond with exactly: OK
+If it violates a rule, respond with ONLY the corrected SQL — no markdown, no
+explanation, no commentary.
+"""
+    try:
+        raw = _groq_chat(client, [{"role": "user", "content": review_prompt}], temperature=0)
+    except InsightGenerationError as exc:
+        logger.warning("Self-review call failed, proceeding without it: %s", exc)
+        return sql, False
+
+    cleaned = raw.replace("```sql", "").replace("```", "").strip()
+    if cleaned.upper() == "OK" or not cleaned:
+        return sql, False
+    if cleaned.rstrip(";").strip().upper() == sql.rstrip(";").strip().upper():
+        return sql, False
+    return cleaned, True
+
+
+def compute_confidence(
+    source: str,
+    business_fixes_applied: list[str],
+    review_changed: bool,
+    schema_issues: list[str],
+) -> int:
+    """
+    Score how much correction was required to reach the final SQL.
+
+    Deterministic templates start at the highest confidence since they carry
+    zero hallucination risk by construction. LLM-generated SQL starts lower
+    and is further penalised for each correction stage that had to intervene
+    — every auto-fix or self-review rewrite is evidence the first-pass
+    output was wrong, so more correction implies lower confidence in
+    whatever mistakes might remain uncaught.
+
+    Parameters
+    ----------
+    source : str
+        ``"template"`` or ``"llm"``.
+    business_fixes_applied : list[str]
+        Fixes applied by :func:`apply_business_rule_fixes`.
+    review_changed : bool
+        Whether :func:`self_review_sql` rewrote the query.
+    schema_issues : list[str]
+        Issues from :func:`validate_sql_schema` (non-empty forces 0).
+
+    Returns
+    -------
+    int
+        Confidence score, 0-100.
+    """
+    if schema_issues:
+        return 0
+
+    score = 95 if source == "template" else 70
+    if business_fixes_applied:
+        score -= 15
+    if review_changed:
+        score -= 15
+    return max(0, min(100, score))
+
+
+# ---------------------------------------------------------------------------
+# NL -> SQL: Orchestrator
+# ---------------------------------------------------------------------------
 
 def ask_data_question(
     question: str,
@@ -1355,15 +1507,9 @@ def ask_data_question(
     client: Groq,
 ) -> dict:
     """
-    End-to-end pipeline: natural-language question → SQL → DB result.
+    End-to-end pipeline: natural-language question -> validated SQL -> result.
 
-    Steps
-    -----
-    1. Translate question to SQL via LLM.
-    2. Check whether the question is relevant to the dataset.
-    3. Run the allowlist safety check.
-    4. Execute the query against the live database.
-    5. Return a structured result dict consumed by ``app.py``.
+    See the module docstring for the full 9-stage pipeline description.
 
     Parameters
     ----------
@@ -1374,42 +1520,99 @@ def ask_data_question(
     Returns
     -------
     dict
-        Always contains ``status`` (str), ``sql`` (str | None),
-        ``data`` (DataFrame | None), ``message`` (str | None).
-        ``status`` is one of: ``"ok"``, ``"not_relevant"``, ``"unsafe"``,
-        ``"error"``.
+        Always contains: ``status``, ``sql``, ``data``, ``message``,
+        ``intent``, ``confidence``, ``reasoning``, ``source``.
+        ``status`` is one of: ``"ok"``, ``"ambiguous"``, ``"not_relevant"``,
+        ``"unsafe"``, ``"error"``.
     """
-    try:
-        sql = natural_language_to_sql(question, client)
-    except InsightGenerationError as exc:
+    result: dict = {
+        "status": None, "sql": None, "data": None, "message": None,
+        "intent": None, "confidence": None, "reasoning": None, "source": None,
+    }
+
+    # 1. Ambiguity check — never guess a business-critical breakdown.
+    clarification = detect_ambiguity(question)
+    if clarification:
+        return {**result, "status": "ambiguous", "message": clarification}
+
+    business_fixes: list[str] = []
+    review_changed = False
+
+    # 2. Intent detection — deterministic templates for common questions.
+    intent = detect_intent(question)
+    if intent:
+        sql = intent["sql"]
+        if "{limit}" in sql:
+            sql = sql.format(limit=_extract_limit(question))
+        source = "template"
+        reasoning = intent["reasoning"]
+    else:
+        # 3. LLM generation, prompt-loaded with business dictionary + rules.
+        try:
+            sql = natural_language_to_sql(question, client)
+        except InsightGenerationError as exc:
+            return {**result, "status": "error", "message": f"LLM translation failed: {exc}"}
+
+        if sql == "NOT_RELEVANT":
+            return {**result, "status": "not_relevant",
+                    "message": "Question is unrelated to the sales dataset."}
+
+        source = "llm"
+        reasoning = "No template matched — SQL generated by the LLM using the injected business dictionary and hard rules."
+
+        # 4. Business-rule auto-fix (deterministic safety net).
+        sql, business_fixes = apply_business_rule_fixes(sql, question)
+        if business_fixes:
+            reasoning += " Auto-corrected: " + " ".join(business_fixes)
+
+        # 5. Self-review (independent second LLM pass).
+        try:
+            sql, review_changed = self_review_sql(sql, question, client)
+            if review_changed:
+                reasoning += " Self-review flagged and rewrote a rule violation."
+        except Exception as exc:
+            logger.warning("Self-review step failed, proceeding with pre-review SQL: %s", exc)
+
+    # 6. Schema validation — only sales_master may be referenced.
+    schema_issues = validate_sql_schema(sql)
+    if schema_issues:
         return {
-            "status": "error", "sql": None, "data": None,
-            "message": f"LLM translation failed: {exc}",
+            **result, "status": "error", "sql": sql, "source": source,
+            "message": "Schema validation failed: " + "; ".join(schema_issues),
         }
 
-    if sql == "NOT_RELEVANT":
-        return {
-            "status": "not_relevant", "sql": None, "data": None,
-            "message": "Question is unrelated to the sales dataset.",
-        }
-
+    # 7. Safety check — SELECT-only allowlist.
     if not is_safe_query(sql):
         logger.warning("Blocked unsafe generated query: %.300s", sql)
         return {
-            "status": "unsafe", "sql": sql, "data": None,
+            **result, "status": "unsafe", "sql": sql, "source": source,
             "message": "Generated query failed the safety check (only SELECT is allowed).",
         }
 
+    # 8. Confidence score.
+    confidence = compute_confidence(source, business_fixes, review_changed, schema_issues)
+
+    # 9. Execute.
     try:
-        result = run_query(engine, sql)
+        data = run_query(engine, sql)
     except Exception as exc:
         return {
-            "status": "error", "sql": sql, "data": None,
+            **result, "status": "error", "sql": sql, "source": source,
+            "confidence": confidence, "reasoning": reasoning,
+            "intent": intent["name"] if intent else None,
             "message": f"Query execution failed: {exc}",
         }
 
-    return {"status": "ok", "sql": sql, "data": result, "message": None}
+    return {
+        "status": "ok", "sql": sql, "data": data, "message": None,
+        "intent": intent["name"] if intent else "llm_generated",
+        "confidence": confidence, "reasoning": reasoning, "source": source,
+    }
 
+
+# ---------------------------------------------------------------------------
+# LLM: business insight generation (unchanged behaviour, reuses _groq_chat)
+# ---------------------------------------------------------------------------
 
 def generate_ai_insight(
     changes_df: pd.DataFrame,
@@ -1459,7 +1662,7 @@ DATA
 
 INSTRUCTIONS
 ------------
-Write a concise executive briefing (5–6 bullet points) covering:
+Write a concise executive briefing (5-6 bullet points) covering:
   1. The top 2 high-growth states — with magnitude and a plausible business driver.
   2. Any states showing a significant decline — risk level and recommended monitoring.
   3. Cross-state patterns or structural observations (e.g. regional concentration risk).
