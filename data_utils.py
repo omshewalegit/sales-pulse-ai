@@ -73,6 +73,14 @@ from sqlalchemy.engine import Engine
 
 load_dotenv()
 
+
+try:
+    import streamlit as st
+    if "GROQ_API_KEY" in st.secrets:
+        os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
+except Exception:
+    pass  
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
